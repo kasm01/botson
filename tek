@@ -1,0 +1,185 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import requests
+import logging
+import threading
+import traceback
+from dotenv import load_dotenv
+from binance.client import Client
+import ta
+from arch import arch_model
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from telegram.ext import Updater, CommandHandler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+from stable_baselines3 import PPO
+import gym
+
+# 📌 **Ortam Değişkenlerini Yükle**
+load_dotenv()
+
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+USE_TESTNET = os.getenv("BINANCE_TESTNET", "True").strip().lower() == "true"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+
+# **🚀 Binance API Bağlantısı**
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=USE_TESTNET)
+
+# 📌 **Logging Sistemi**
+logging.basicConfig(filename="bot4.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# 📌 **Telegram Bildirim Sistemi**
+def send_telegram_message(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        requests.post(url, data=data)
+    except Exception as e:
+        logging.error(f"Telegram hatası: {str(e)}")
+
+# 📌 **Binance API'den Piyasa Verisini Çek**
+def get_binance_ta(symbol="BTCUSDT", interval="1h", limit=100):
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        return [float(candle[4]) for candle in klines]  # Kapanış fiyatları
+    except Exception as e:
+        logging.error(f"Binance veri çekme hatası: {str(e)}")
+        return None
+
+# 📌 **RSI Hesaplama**
+def calculate_rsi(prices):
+    if len(prices) < 15:
+        return None
+    df = pd.DataFrame(prices, columns=["close"])
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    return df["rsi"].iloc[-1]  # Son RSI değeri
+
+# 📌 **Volatilite Tahmini (GARCH)**
+def predict_volatility(prices):
+    try:
+        model = arch_model(prices, vol='Garch', p=1, q=1)
+        fitted = model.fit(disp="off")
+        return fitted.conditional_volatility[-1]
+    except Exception as e:
+        logging.error(f"GARCH hatası: {str(e)}")
+        return None
+
+# 📌 **AI Destekli LSTM Modeli ile Fiyat Tahmini**
+def train_lstm_model(price_data, epochs=20, batch_size=32):
+    try:
+        scaler = MinMaxScaler(feature_range=(0,1))
+        scaled_data = scaler.fit_transform(np.array(price_data).reshape(-1, 1))
+
+        X, y = [], []
+        for i in range(60, len(scaled_data)):
+            X.append(scaled_data[i-60:i, 0])
+            y.append(scaled_data[i, 0])
+
+        X, y = np.array(X), np.array(y)
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+
+        model = Sequential([
+            LSTM(units=50, return_sequences=True, input_shape=(X.shape[1], 1)),
+            Dropout(0.2),
+            LSTM(units=50),
+            Dropout(0.2),
+            Dense(units=1)
+        ])
+        
+        model.compile(optimizer="adam", loss="mse")
+        model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=1)
+        
+        return model, scaler
+    except Exception as e:
+        logging.error(f"LSTM modeli eğitme hatası: {str(e)}")
+        return None, None
+
+# 📌 **AI Destekli Reinforcement Learning ile İşlem Açma**
+def reinforcement_trade():
+    try:
+        env = gym.make("CartPole-v1")
+        model = PPO("MlpPolicy", env, verbose=1)
+        model.learn(total_timesteps=10000)
+        action, _ = model.predict(env.reset())
+        return "LONG" if action == 1 else "SHORT"
+    except Exception as e:
+        logging.error(f"Reinforcement Learning hatası: {str(e)}")
+        return "NEUTRAL"
+
+# 📌 **Risk Yönetimi: Stop-Loss ve Take-Profit Hesaplama**
+def calculate_stop_loss(entry_price, volatility):
+    return round(entry_price * (1 - np.interp(volatility, [0.01, 0.05], [0.005, 0.02])), 2)
+
+def calculate_take_profit(entry_price, volatility):
+    return round(entry_price * (1 + np.interp(volatility, [0.01, 0.05], [0.01, 0.04])), 2)
+
+# 📌 **Dinamik Kaldıraç Yönetimi**
+def dynamic_leverage(volatility):
+    return 10 if volatility < 0.005 else 7 if volatility < 0.015 else 5 if volatility < 0.03 else 3 if volatility < 0.05 else 1
+
+# 📌 **Binance Futures İşlem Açma**
+def execute_trade_safe(symbol, trade_type, quantity, leverage):
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=leverage)
+        side = "BUY" if trade_type == "LONG" else "SELL"
+        client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=quantity
+        )
+        send_telegram_message(f"🚀 {trade_type} işlemi açıldı: {symbol}, Kaldıraç: {leverage}x")
+    except Exception as e:
+        logging.error(f"İşlem açma hatası: {str(e)}")
+
+# 📌 **Haber Analizi**
+def get_crypto_news():
+    try:
+        url = f"https://newsapi.org/v2/everything?q=bitcoin&apiKey={NEWSAPI_KEY}"
+        response = requests.get(url)
+        return response.json()["articles"][:5]
+    except Exception as e:
+        logging.error(f"Haber analizi hatası: {str(e)}")
+        return None
+
+# 📌 **Telegram Bot Komutları**
+def update_stop_loss(update, context):
+    try:
+        new_sl = float(context.args[0])
+        global STOP_LOSS
+        STOP_LOSS = new_sl
+        update.message.reply_text(f"🛑 Stop-Loss {new_sl} USD olarak güncellendi!")
+    except Exception as e:
+        logging.error(f"Stop-Loss güncelleme hatası: {str(e)}")
+
+# 📌 **Botun Çalıştırılması**
+if __name__ == "__main__":
+    try:
+        prices = get_binance_ta()
+        if not prices or len(prices) < 60:
+            raise ValueError("⚠️ Binance API'den yeterli veri yok!")
+
+        entry_price = prices[-1]
+        market_volatility = predict_volatility(prices)
+
+        lstm_model, lstm_scaler = train_lstm_model(prices)
+        predicted_price = predict_price_lstm(lstm_model, lstm_scaler, prices[-60:])
+
+        trade_type = reinforcement_trade()
+        stop_loss = calculate_stop_loss(entry_price, market_volatility)
+        take_profit = calculate_take_profit(entry_price, market_volatility)
+        leverage = dynamic_leverage(market_volatility)
+
+        if trade_type in ["LONG", "SHORT"]:
+            execute_trade_safe("BTCUSDT", trade_type, 0.01, leverage)
+            send_telegram_message(f"📈 AI Kararı: {trade_type} | Fiyat: {predicted_price} USD")
+
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        send_telegram_message(f"🚨 Hata: {str(e)}")
