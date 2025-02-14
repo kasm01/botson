@@ -27,8 +27,8 @@ from bayes_opt import BayesianOptimization
 # 📌 **Ortam Değişkenlerini Yükle**
 load_dotenv()
 
-BINANCE_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_TESTNET_API_SECRET")
+BINANCE_API_KEY = os.getenv("70545197030f91dcd85316478ef03e15fdf565514a0bfcd6afe915dc93b0c69b")
+BINANCE_API_SECRET = os.getenv("8c403fbf9b9bdd003bc38a7162f89b96f8f97a3df48244a542685023dc9b2033")
 
 # 📌 Binance Futures TESTNET API bağlantısı
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
